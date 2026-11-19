@@ -84,11 +84,29 @@ public class NoteList : ListBox
     }
 }
 
-// 마크다운 기호는 그대로 두고 흐리게 보이게, 내용은 제목·굵게·체크 등으로 바로 꾸며 주는 입력창 (저장은 평범한 마크다운 글)
+// 마크다운을 바로 꾸며 보여 주는 입력창 (저장은 평범한 마크다운 글).
+// 기호(#, **, - 등)는 숨기고, 커서가 있는 줄에서만 흐리게 보여서 고칠 수 있게 한다 (옵시디언 방식).
 public class MarkdownBox : RichTextBox
 {
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, ref Point l);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, ref CHARFORMAT2 l);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct CHARFORMAT2
+    {
+        public int cbSize;
+        public uint dwMask, dwEffects;
+        public int yHeight, yOffset, crTextColor;
+        public byte bCharSet, bPitchAndFamily;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szFaceName;
+        public short wWeight, sSpacing;
+        public int crBackColor, lcid, dwReserved;
+        public short sStyle, wKerning;
+        public byte bUnderlineType, bAnimation, bRevAuthor, bReserved1;
+    }
+    const int EM_SETCHARFORMAT = 0x444, SCF_SELECTION = 1;
+    const uint CFM_HIDDEN = 0x100, CFE_HIDDEN = 0x100;
     [DllImport("user32.dll", EntryPoint = "SendMessage")]
     static extern IntPtr SendMessageOle(IntPtr h, int msg, IntPtr w, [MarshalAs(UnmanagedType.IUnknown)] out object l);
     [DllImport("imm32.dll")] static extern IntPtr ImmGetContext(IntPtr h);
@@ -112,6 +130,8 @@ public class MarkdownBox : RichTextBox
     Dictionary<string, Font> fonts = new Dictionary<string, Font>();
     Timer timer;
     bool needFull;
+    int activeStart = -1;    // 기호를 보여 주고 있는 줄(커서 줄)의 시작 위치
+    int leftStart = -1;      // 커서가 막 떠난 줄: 다음 꾸미기 때 기호를 다시 숨긴다
 
     public MarkdownBox()
     {
@@ -124,15 +144,47 @@ public class MarkdownBox : RichTextBox
         {
             if (Composing()) return;   // 한글 조합 중에 꾸미면 조합이 끊긴다
             timer.Stop();
-            Restyle(needFull);
+            Restyle(needFull, leftStart);
             needFull = false;
+            leftStart = -1;
         };
     }
 
+    void Later() { timer.Stop(); timer.Start(); }
+
     protected override void OnTextChanged(EventArgs e)
     {
-        if (!Styling) { timer.Stop(); timer.Start(); }
+        if (!Styling) Later();
         base.OnTextChanged(e);
+    }
+
+    // 커서가 다른 줄로 가면 (바로 말고 잠시 뒤에) 떠난 줄은 기호를 숨기고 새 줄은 보여 준다.
+    // 바로 바꾸면 체크박스를 누르는 도중에 줄 모양이 바뀌어 엉뚱한 곳이 눌린다.
+    protected override void OnSelectionChanged(EventArgs e)
+    {
+        base.OnSelectionChanged(e);
+        if (Styling || !Focused) return;
+        int start = LineStart(Text, SelectionStart);
+        if (start == activeStart) return;
+        if (leftStart < 0) leftStart = activeStart;
+        activeStart = start;
+        Later();
+    }
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Later(); }   // 커서 줄의 기호를 보여 준다
+
+    protected override void OnLostFocus(EventArgs e)
+    {
+        base.OnLostFocus(e);
+        if (leftStart < 0) leftStart = activeStart;   // 다른 곳을 누르면 커서 줄도 꾸민 모양으로
+        activeStart = -1;
+        Later();
+    }
+
+    static int LineStart(string text, int pos)
+    {
+        pos = Math.Min(pos, text.Length);
+        return pos > 0 ? text.LastIndexOf('\n', pos - 1) + 1 : 0;
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
@@ -199,20 +251,26 @@ public class MarkdownBox : RichTextBox
         catch (Exception) { }   // 못 멈추면 서식 변경이 되돌리기 기록에 섞일 뿐
     }
 
-    // all이 아니면 커서가 있는 줄과 바로 윗줄만 (Enter로 줄이 나뉘거나 합쳐질 때 두 줄이 바뀐다)
-    public void Restyle(bool all)
+    // all이 아니면 커서가 있는 줄과 바로 윗줄(Enter로 줄이 나뉘거나 합쳐지면 두 줄이 바뀐다), 그리고 커서가 떠난 줄만
+    public void Restyle(bool all, int extra = -1)
     {
         if (!IsHandleCreated) return;
         string text = Text;
         int caret = SelectionStart, selLen = SelectionLength;
-        int from = 0, to = text.Length;
-        if (!all)
+        int raw = Focused ? LineStart(text, caret) : -1;   // 기호를 보여 줄 줄
+        activeStart = raw;
+        var ranges = new List<int[]>();
+        if (all) ranges.Add(new[] { 0, text.Length });
+        else
         {
-            int c = Math.Min(caret, text.Length);
-            int cur = c > 0 ? text.LastIndexOf('\n', c - 1) + 1 : 0;
-            from = cur >= 2 ? text.LastIndexOf('\n', cur - 2) + 1 : 0;
-            to = text.IndexOf('\n', c);
-            if (to < 0) to = text.Length;
+            int cur = LineStart(text, caret);
+            int to = text.IndexOf('\n', Math.Min(caret, text.Length));
+            ranges.Add(new[] { cur >= 1 ? LineStart(text, cur - 1) : 0, to < 0 ? text.Length : to });
+            if (extra >= 0 && extra <= text.Length)
+            {
+                int s = LineStart(text, extra);
+                if (s < ranges[0][0] || s > ranges[0][1]) ranges.Add(new[] { s, s });
+            }
         }
 
         var scroll = new Point();
@@ -222,14 +280,17 @@ public class MarkdownBox : RichTextBox
         SetUndoRecording(false);
         try
         {
-            int pos = from;
-            while (true)
+            foreach (var r in ranges)
             {
-                int end = text.IndexOf('\n', pos);
-                if (end < 0) end = text.Length;
-                StyleLine(pos, text.Substring(pos, end - pos));
-                if (end >= to) break;
-                pos = end + 1;
+                int pos = r[0];
+                while (true)
+                {
+                    int end = text.IndexOf('\n', pos);
+                    if (end < 0) end = text.Length;
+                    StyleLine(pos, text.Substring(pos, end - pos), pos == raw);
+                    if (end >= r[1]) break;
+                    pos = end + 1;
+                }
             }
         }
         finally
@@ -251,10 +312,28 @@ public class MarkdownBox : RichTextBox
         SelectionBackColor = back;
     }
 
-    void StyleLine(int s, string line)
+    void SetHidden(int start, int length, bool hidden)
+    {
+        if (length <= 0) return;
+        Select(start, length);
+        var cf = new CHARFORMAT2 { cbSize = Marshal.SizeOf(typeof(CHARFORMAT2)), dwMask = CFM_HIDDEN, dwEffects = hidden ? CFE_HIDDEN : 0 };
+        SendMessage(Handle, EM_SETCHARFORMAT, new IntPtr(SCF_SELECTION), ref cf);
+    }
+
+    // 기호 부분: 커서 줄(raw)이면 흐리게 보여 주고, 아니면 숨긴다
+    void Mark(int start, int length, Font font, bool raw, Color back)
+    {
+        Style(start, length, font, Muted, back);
+        if (!raw) SetHidden(start, length, true);
+    }
+
+    void StyleLine(int s, string line, bool raw)
     {
         var body = F(BaseSize, FontStyle.Regular);
         Style(s, line.Length, body, Ink, BackColor);
+        SetHidden(s, line.Length, false);
+        Select(s, 0);
+        SelectionBullet = false;
         if (line.Length == 0) return;
 
         var m = Heading.Match(line);
@@ -263,41 +342,60 @@ public class MarkdownBox : RichTextBox
             int level = m.Groups[1].Length;
             var font = F(level == 1 ? BaseSize * 1.6f : level == 2 ? BaseSize * 1.3f : BaseSize * 1.1f, FontStyle.Bold);
             Style(s, line.Length, font, Ink, BackColor);
-            Style(s, m.Length, font, Muted, BackColor);
+            Mark(s, m.Length, font, raw, BackColor);
             return;
         }
         if ((m = Quote.Match(line)).Success)
         {
             Style(s, line.Length, F(BaseSize, FontStyle.Italic), Muted, BackColor);
+            Mark(s, m.Length, F(BaseSize, FontStyle.Italic), raw, BackColor);
             return;
         }
+        int done = -1;   // 끝난 할 일이면 내용이 시작하는 위치
         if ((m = Check.Match(line)).Success)
         {
-            Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);
-            if (m.Groups[2].Value != " ")
-            {
-                Style(s + m.Length, line.Length - m.Length, F(BaseSize, FontStyle.Strikeout), Muted, BackColor);
-                return;
-            }
+            // "- " 는 숨기고 "[ ]" / "[x]" 는 금색으로 남겨 체크박스처럼 보이게 (누르면 체크)
+            int box = line.IndexOf('[');
+            Mark(s, box, body, raw, BackColor);
+            Style(s + box, m.Groups[1].Length - box, F(BaseSize, FontStyle.Bold), Accent, BackColor);
+            if (m.Groups[2].Value != " ") done = m.Length;
         }
         else if ((m = Bullet.Match(line)).Success)
-            Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);
+        {
+            if (char.IsDigit(m.Groups[1].Value.Trim()[0]))
+                Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);   // 번호는 글자 그대로
+            else if (raw)
+                Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);
+            else
+            {
+                // "- " 를 숨기고 그 자리에 Windows 글머리 기호(•)를 보여 준다
+                SetHidden(s, m.Length, true);
+                Select(s, 0);
+                SelectionBullet = true;
+            }
+        }
 
         foreach (Match b in Bold.Matches(line))
         {
             Style(s + b.Index, b.Length, F(BaseSize, FontStyle.Bold), Ink, BackColor);
-            Style(s + b.Index, 2, F(BaseSize, FontStyle.Bold), Muted, BackColor);
-            Style(s + b.Index + b.Length - 2, 2, F(BaseSize, FontStyle.Bold), Muted, BackColor);
+            Mark(s + b.Index, 2, F(BaseSize, FontStyle.Bold), raw, BackColor);
+            Mark(s + b.Index + b.Length - 2, 2, F(BaseSize, FontStyle.Bold), raw, BackColor);
         }
         foreach (Match x in Strike.Matches(line))
+        {
             Style(s + x.Index, x.Length, F(BaseSize, FontStyle.Strikeout), Muted, BackColor);
+            Mark(s + x.Index, 2, F(BaseSize, FontStyle.Strikeout), raw, BackColor);
+            Mark(s + x.Index + x.Length - 2, 2, F(BaseSize, FontStyle.Strikeout), raw, BackColor);
+        }
         foreach (Match c in Code.Matches(line))
         {
             var mono = F(BaseSize * 0.95f, FontStyle.Regular, "Consolas");
             Style(s + c.Index, c.Length, mono, Ink, CodeBack);
-            Style(s + c.Index, 1, mono, Muted, CodeBack);
-            Style(s + c.Index + c.Length - 1, 1, mono, Muted, CodeBack);
+            Mark(s + c.Index, 1, mono, raw, CodeBack);
+            Mark(s + c.Index + c.Length - 1, 1, mono, raw, CodeBack);
         }
+        // 끝난 할 일은 안쪽 꾸밈을 덮어 회색 취소선으로 (숨긴 기호는 그대로 숨김)
+        if (done >= 0) Style(s + done, line.Length - done, F(BaseSize, FontStyle.Strikeout), Muted, BackColor);
     }
 
     protected override void Dispose(bool disposing)
@@ -307,13 +405,12 @@ public class MarkdownBox : RichTextBox
     }
 }
 
-// 바로 가기를 담는 둥근 카드. 비어 있거나 파일을 끌고 오는 중이면 점선 테두리로 놓을 자리를 알려 준다
+// 바로 가기 아이콘들을 늘어놓는 칸
 public class ShortcutPanel : FlowLayoutPanel
 {
-    public Color Card, Border, DragCard, DragBorder, Muted;
-    public Font HintFont, HintSubFont;
+    public Color DragCard, DragBorder;
+    public Font HintFont;
     public int Radius = 12;
-    public float Dpi = 1;
     bool dragging;
 
     public ShortcutPanel()
@@ -328,41 +425,26 @@ public class ShortcutPanel : FlowLayoutPanel
         set { if (dragging != value) { dragging = value; Invalidate(true); } }
     }
 
-    public Color Fill { get { return dragging ? DragCard : Card; } }
+    public Color Fill { get { return dragging ? DragCard : BackColor; } }
 
     protected override void OnScroll(ScrollEventArgs se) { base.OnScroll(se); Invalidate(); }
     protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Invalidate(); }
     protected override void OnControlAdded(ControlEventArgs e) { base.OnControlAdded(e); Invalidate(); }
     protected override void OnControlRemoved(ControlEventArgs e) { base.OnControlRemoved(e); Invalidate(); }
 
+    // 평소엔 아무 장식 없이 아이콘만, 파일을 끌고 오는 동안만 연한 노란 바탕으로 놓을 자리를 알려 준다
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.Clear(BackColor);
-        int inset = (int)Math.Ceiling(Dpi * 2);
-        var r = new Rectangle(inset, inset, Width - inset * 2 - 1, Height - inset * 2 - 1);
-        bool empty = Controls.Count == 0;
-        using (var path = MemoDesktop.RoundRect(r, Radius))
-        using (var b = new SolidBrush(Fill))
-        using (var pen = new Pen(dragging ? DragBorder : Border, Dpi * (dragging ? 2 : 1.2f)))
-        {
-            if (dragging || empty) pen.DashPattern = new[] { 4f, 3f };
+        if (!dragging) return;
+        using (var path = MemoDesktop.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), Radius))
+        using (var b = new SolidBrush(DragCard))
             g.FillPath(b, path);
-            g.DrawPath(pen, path);
-        }
-        if (!empty && !dragging) return;
-        string main = dragging ? "여기에 놓으면 이 메모의 바로 가기가 돼요" : "＋  파일 · 폴더 · 앱을 여기로 끌어다 놓으세요";
-        string sub = dragging ? "" : "이 메모를 열었을 때만 보이는 바로 가기가 돼요";
-        var flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
-        int mid = r.Y + r.Height / 2;
-        if (sub.Length == 0) TextRenderer.DrawText(g, main, HintFont, r, dragging ? DragBorder : Muted, flags);
-        else
-        {
-            int lh = HintFont.Height;
-            TextRenderer.DrawText(g, main, HintFont, new Rectangle(r.X, mid - lh, r.Width, lh), Muted, flags);
-            TextRenderer.DrawText(g, sub, HintSubFont, new Rectangle(r.X, mid + (int)(Dpi * 4), r.Width, HintSubFont.Height), Muted, flags);
-        }
+        if (Controls.Count == 0)
+            TextRenderer.DrawText(g, "여기에 놓으세요", HintFont, ClientRectangle, DragBorder,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
     }
 }
 
@@ -422,15 +504,14 @@ public class MemoDesktop : Form
     [DllImport("user32.dll")] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string name);
     delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
-    [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr child, IntPtr parent);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
-    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr h);
-    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
-    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int idx, int v);
-    [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr v);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
@@ -440,14 +521,17 @@ public class MemoDesktop : Form
     [ComImport, Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IShellItemImageFactory { [PreserveSig] int GetImage(SIZE size, int flags, out IntPtr hbitmap); }
 
-    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
-    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct WINDOWPOS { public IntPtr hwnd, hwndInsertAfter; public int x, y, cx, cy; public uint flags; }
 
-    const int GWL_STYLE = -16, GWL_EXSTYLE = -20;
-    const int WS_CHILD = 0x40000000, WS_POPUP = unchecked((int)0x80000000);
-    const int WS_EX_LAYERED = 0x80000, WS_EX_TOOLWINDOW = 0x80;
-    const uint SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
+    const int WS_EX_TOOLWINDOW = 0x80, WM_WINDOWPOSCHANGING = 0x46;
+    const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10;
+    const uint GW_HWNDPREV = 3, EVENT_SYSTEM_FOREGROUND = 3;
+    static readonly IntPtr HWND_TOP = IntPtr.Zero, HWND_BOTTOM = new IntPtr(1);
+    // 잠깐 앞에 떠도 메모를 다시 내리지 않을 창들 (작업 표시줄, 시작 메뉴, Alt+Tab 화면 등)
+    static readonly HashSet<string> ShellPopups = new HashSet<string> { "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+        "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow", "ForegroundStaging", "MultitaskingViewFrame", "TaskListThumbnailWnd" };
 
     static readonly Color Desk = Color.FromArgb(233, 231, 226), Paper = Color.White, Side = Color.FromArgb(246, 245, 242),
         Line = Color.FromArgb(226, 224, 219), Ink = Color.FromArgb(29, 29, 31), Gray = Color.FromArgb(138, 138, 142),
@@ -456,9 +540,12 @@ public class MemoDesktop : Form
         CodeBack = Color.FromArgb(243, 241, 236);
     const string FontName = "맑은 고딕";
 
-    IntPtr parent;
-    Size hostSize;
-    float k = 1;             // DPI 배율 (이 프로세스는 실제 픽셀 단위로 그린다)
+    IntPtr desktop;          // 바탕화면 아이콘 층을 가진 창. 메모는 늘 이 창 바로 위에 있다
+    bool onTop;              // Win+D 등으로 바탕화면이 앞에 나온 동안은 메모도 맨 앞에 둔다
+    IntPtr hook;
+    WinEventProc foregroundProc;   // 가비지 수집되면 훅이 죽으므로 붙잡아 둔다
+    uint myPid = (uint)Process.GetCurrentProcess().Id;
+    float k = 1;            // DPI 배율 (이 프로세스는 실제 픽셀 단위로 그린다)
     Rectangle win;           // 화면 가운데 떠 있는 메모 창 영역
     int sideW, x0, w0, dividerY;
     string dataPath;
@@ -496,18 +583,14 @@ public class MemoDesktop : Form
         BackColor = Desk;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
 
-        FindHost();
-        uint dpi = GetDpiForWindow(parent);
+        FindDesktop();
+        uint dpi = GetDpiForWindow(desktop);
         if (dpi > 0) k = dpi / 96f;
-        RECT rc; GetClientRect(parent, out rc);
-        hostSize = new Size(rc.R - rc.L, rc.B - rc.T);
-        Bounds = new Rectangle(Point.Empty, hostSize);
 
-        // 작업 표시줄을 뺀 주 모니터 영역 가운데에 창을 띄운다
+        // 작업 표시줄은 가리지 않는다 (화면 전체를 덮으면 Windows가 전체 화면 앱으로 보고 작업 표시줄을 숨긴다)
         var wa = Screen.PrimaryScreen.WorkingArea;
-        var p = new POINT { X = wa.X, Y = wa.Y };
-        ScreenToClient(parent, ref p);
-        var area = new Rectangle(p.X, p.Y, wa.Width, wa.Height);
+        Bounds = wa;
+        var area = new Rectangle(Point.Empty, wa.Size);
         win = Rectangle.Inflate(area, -(int)(area.Width * 0.05), -(int)(area.Height * 0.06));
 
         saveTimer = new Timer { Interval = 600 };
@@ -519,12 +602,11 @@ public class MemoDesktop : Form
 
     int S(float v) { return (int)Math.Round(v * k); }
 
-    void FindHost()
+    void FindDesktop()
     {
         IntPtr progman = FindWindow("Progman", null);
         if (progman == IntPtr.Zero) throw new InvalidOperationException("바탕화면(Progman) 창을 찾을 수 없습니다.");
-        // 아이콘 층(SHELLDLL_DefView)을 가진 창에 붙어야 아이콘 위에 올라간다
-        if (FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero) { parent = progman; return; }
+        if (FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero) { desktop = progman; return; }
         // 이전 Windows에서 다른 배경 프로그램이 아이콘 층을 WorkerW로 옮겨 둔 경우
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) =>
@@ -532,7 +614,7 @@ public class MemoDesktop : Form
             if (FindWindowEx(h, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero) found = h;
             return true;
         }, IntPtr.Zero);
-        parent = found != IntPtr.Zero ? found : progman;
+        desktop = found != IntPtr.Zero ? found : progman;
     }
 
     // ---- 화면 구성 ----
@@ -572,13 +654,13 @@ public class MemoDesktop : Form
 
         x0 = win.X + sideW + S(56);
         w0 = win.Right - S(56) - x0;
-        int iconsH = S(148);
-        dividerY = win.Bottom - iconsH - S(76);   // 바로 가기 영역의 위쪽 경계
+        int iconsH = S(116);
+        dividerY = win.Bottom - iconsH - S(64);   // 본문과 바로 가기 사이의 가는 선
 
         editor = new MarkdownBox
         {
             BackColor = Paper, ForeColor = Ink, Ink = Ink, Muted = Gray, Accent = Gold, CodeBack = CodeBack,
-            FontName = FontName, BaseSize = 13f, Font = new Font(FontName, 13f), MaxLength = int.MaxValue,
+            FontName = FontName, BaseSize = 13f, Font = new Font(FontName, 13f), MaxLength = int.MaxValue, BulletIndent = S(14),
             Bounds = new Rectangle(x0, win.Y + S(48), w0, dividerY - S(12) - (win.Y + S(48)))
         };
         editor.TextChanged += (s, e) =>
@@ -596,26 +678,19 @@ public class MemoDesktop : Form
 
         iconsTitle = new Label
         {
-            Font = new Font(FontName, 10f, FontStyle.Bold), ForeColor = Ink, BackColor = Paper, AutoSize = false,
+            Font = new Font(FontName, 9f), ForeColor = Gray, BackColor = Paper, AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft,
-            Bounds = new Rectangle(x0, dividerY + S(16), w0 / 2, S(30))
-        };
-        var iconsHint = new Label
-        {
-            Text = "더블클릭으로 열기 · 오른쪽 클릭으로 빼기", Font = new Font(FontName, 9f), ForeColor = Gray, BackColor = Paper,
-            AutoSize = false, TextAlign = ContentAlignment.MiddleRight,
-            Bounds = new Rectangle(x0 + w0 / 2, dividerY + S(16), w0 - w0 / 2, S(30))
+            Bounds = new Rectangle(x0, dividerY + S(10), w0, S(28))
         };
         icons = new ShortcutPanel
         {
-            BackColor = Paper, AutoScroll = true, Card = Card, Border = Line, DragCard = DragCard, DragBorder = Gold, Muted = Gray,
-            HintFont = new Font(FontName, 10.5f), HintSubFont = new Font(FontName, 9f), Radius = S(12), Dpi = k,
-            Padding = new Padding(S(10)),
-            Bounds = new Rectangle(x0, win.Bottom - iconsH - S(24), w0, iconsH)
+            BackColor = Paper, AutoScroll = true, DragCard = DragCard, DragBorder = Gold,
+            HintFont = new Font(FontName, 10f), Radius = S(12),
+            Bounds = new Rectangle(x0 - S(6), win.Bottom - iconsH - S(20), w0 + S(12), iconsH)
         };
-        foreach (Control c in new Control[] { this, iconsTitle, iconsHint, icons }) AcceptDrops(c);
+        foreach (Control c in new Control[] { this, iconsTitle, icons }) AcceptDrops(c);
 
-        Controls.AddRange(new Control[] { newBtn, list, editor, iconsTitle, iconsHint, icons });
+        Controls.AddRange(new Control[] { newBtn, list, editor, iconsTitle, icons });
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -637,6 +712,7 @@ public class MemoDesktop : Form
             g.FillRectangle(side, win.X, win.Y, sideW, win.Height);
             g.ResetClip();
             g.DrawLine(pen, win.X + sideW, win.Y, win.X + sideW, win.Bottom);
+            g.DrawLine(pen, x0, dividerY, x0 + w0, dividerY);
             g.DrawPath(pen, path);
         }
         // 맥 창 왼쪽 위의 빨강·노랑·초록 버튼 (장식)
@@ -658,7 +734,7 @@ public class MemoDesktop : Form
         return p;
     }
 
-    static readonly Regex LineMarks = new Regex(@"^(#{1,6}\s+|\s*[-*+]\s\[[ xX]\]\s+|\s*(?:[-*+]|\d+\.)\s+|>\s?)");
+    static readonly Regex LineMarks = new Regex(@"^(#{1,6}(\s+|$)|\s*[-*+]\s\[[ xX]\]\s+|\s*(?:[-*+]|\d+\.)\s+|>\s?)");
 
     // 목록에 보일 제목·미리보기: 앞의 빈 줄을 건너뛴 첫 두 줄을 마크다운 기호 없이 (글 전체를 나누지 않고 앞에서부터 찾는다)
     static string[] Preview(string text)
@@ -831,8 +907,9 @@ public class MemoDesktop : Form
         if (current != null)
             foreach (var path in current.Items) icons.Controls.Add(MakeTile(path));
         icons.ResumeLayout();
-        int n = current == null ? 0 : current.Items.Count;
-        iconsTitle.Text = n == 0 ? "바로 가기" : "바로 가기  " + n;
+        bool empty = current == null || current.Items.Count == 0;
+        iconsTitle.Text = empty ? "바로 가기  ·  파일, 폴더, 프로그램을 여기로 끌어다 놓으세요"
+                                : "바로 가기  ·  더블클릭으로 열기, 오른쪽 클릭으로 빼기";
     }
 
     Tile MakeTile(string path)
@@ -911,14 +988,15 @@ public class MemoDesktop : Form
         }
     }
 
-    // ---- 바탕화면에 붙이기 ----
+    // ---- 바탕화면 바로 위에 머물기 ----
+    // 탐색기 창 안에 자식으로 끼워 넣으면 한글 입력기가 연결되지 않아서, 독립된 창으로 두고 늘 바탕화면 바로 위에 깔아 둔다.
 
     protected override CreateParams CreateParams
     {
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= WS_EX_TOOLWINDOW;
+            cp.ExStyle |= WS_EX_TOOLWINDOW;   // 작업 표시줄·Alt+Tab에 안 보이게
             return cp;
         }
     }
@@ -928,15 +1006,15 @@ public class MemoDesktop : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        // WinForms가 창을 다 만든 뒤에 붙여야 한다 (더 일찍 붙이면 WinForms가 다시 떼어 숨겨버림)
-        Attach();
         ShowNote();   // 처음 불러올 때는 입력창이 아직 만들어지기 전이라 꾸미기를 못 했다
+        foregroundProc = OnForeground;
+        hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, foregroundProc, 0, 0, 0);
+        SinkToDesktop();
         poll = new Timer { Interval = 1000 };
         poll.Tick += (s, a) =>
         {
-            // 끄기 신호를 받았거나 탐색기가 재시작되면 저장하고 종료, 떨어졌으면 다시 붙임
-            if (stop.WaitOne(0) || !IsWindow(parent)) { Close(); return; }
-            if (GetParent(Handle) != parent) Attach();
+            if (stop.WaitOne(0)) { Close(); return; }   // 끄기 신호: 저장하고 종료
+            if (!IsWindow(desktop)) FindDesktop();      // 탐색기가 다시 시작됨
         };
         poll.Start();
     }
@@ -944,19 +1022,49 @@ public class MemoDesktop : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         Save();
+        if (hook != IntPtr.Zero) UnhookWinEvent(hook);
         base.OnFormClosing(e);
     }
 
-    void Attach()
+    void SinkToDesktop()
     {
-        int style = GetWindowLong(Handle, GWL_STYLE);
-        SetWindowLong(Handle, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD);
-        SetParent(Handle, parent);
-        // 24H2의 Progman 자식은 레이어드 창이어야 합성(DirectComposition)에 그려진다
-        SetWindowLong(Handle, GWL_EXSTYLE, GetWindowLong(Handle, GWL_EXSTYLE) | WS_EX_LAYERED);
-        SetLayeredWindowAttributes(Handle, 0, 255, 2);
-        // HWND_TOP: 아이콘 층보다 위 (그래서 클릭과 글쓰기가 된다)
-        SetWindowPos(Handle, IntPtr.Zero, 0, 0, hostSize.Width, hostSize.Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        onTop = false;
+        SetWindowPos(Handle, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // 실제 자리는 WndProc에서 정함
+    }
+
+    // 다른 프로그램으로 넘어가면 메모를 바탕화면 바로 위로 내리고, 바탕화면이 앞에 나오면(Win+D, 빈 곳 클릭) 메모도 앞으로
+    void OnForeground(IntPtr h, uint ev, IntPtr hwnd, int obj, int child, uint thread, uint time)
+    {
+        if (hwnd == IntPtr.Zero || hwnd == Handle) return;
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        if (pid == myPid) return;   // 메모 삭제 확인 창 등 우리 창
+        var cls = new StringBuilder(64);
+        GetClassName(hwnd, cls, cls.Capacity);
+        string c = cls.ToString();
+        if (c == "Progman" || c == "WorkerW")
+        {
+            onTop = true;
+            SetWindowPos(Handle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        else if (!ShellPopups.Contains(c)) SinkToDesktop();
+    }
+
+    // 누가 메모를 앞으로 올리려 해도(클릭 등) 바탕화면 바로 위 자리를 지킨다
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_WINDOWPOSCHANGING && !onTop && desktop != IntPtr.Zero)
+        {
+            var wp = (WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(WINDOWPOS));
+            if ((wp.flags & SWP_NOZORDER) == 0)
+            {
+                IntPtr above = GetWindow(desktop, GW_HWNDPREV);   // 바탕화면 바로 위 창. 그 아래로 들어가면 바탕화면 바로 위가 된다
+                if (above == IntPtr.Zero || above == Handle) wp.flags |= SWP_NOZORDER;
+                else wp.hwndInsertAfter = above;
+                Marshal.StructureToPtr(wp, m.LParam, false);
+            }
+        }
+        base.WndProc(ref m);
     }
 }
 '@
