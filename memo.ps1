@@ -66,10 +66,58 @@ public class Note
 // 기본 ListBox는 항목을 다시 그릴 때마다 지웠다 그려서 깜빡이므로, 화면 밖에서 다 그린 뒤 한 번에 내보낸다
 public class NoteList : ListBox
 {
+    public event Action<int, int> ItemMoved;   // 끌어서 from 자리의 메모를 to 자리로
+    public event Action DragFinished;
+    public int DragThreshold = 8;
+    int pressIndex = -1;
+    Point pressAt;
+    bool moving;
+
     public NoteList()
     {
         DrawMode = DrawMode.OwnerDrawFixed;
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+    }
+
+    static Point PointOf(IntPtr lParam)
+    {
+        long v = lParam.ToInt64();
+        return new Point((short)(v & 0xFFFF), (short)((v >> 16) & 0xFFFF));
+    }
+
+    // 왼쪽 버튼은 직접 처리한다: 기본 ListBox는 누른 채 움직이면 선택이 커서를 따라가 버려서 끌어 옮기기와 부딪친다
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_LBUTTONDBLCLK = 0x203;
+        if (m.Msg == WM_LBUTTONDOWN || m.Msg == WM_LBUTTONDBLCLK)
+        {
+            Focus();
+            pressAt = PointOf(m.LParam);
+            pressIndex = IndexFromPoint(pressAt);
+            moving = false;
+            Capture = true;
+            if (pressIndex >= 0) SelectedIndex = pressIndex;
+            return;
+        }
+        if (m.Msg == WM_MOUSEMOVE && pressIndex >= 0 && Capture)
+        {
+            var p = PointOf(m.LParam);
+            if (!moving && Math.Abs(p.Y - pressAt.Y) < DragThreshold) return;
+            moving = true;
+            int to = p.Y < 0 ? 0 : IndexFromPoint(p);
+            if (to < 0) to = Items.Count - 1;   // 목록 아래로 끌면 맨 끝
+            if (to != pressIndex && ItemMoved != null) { ItemMoved(pressIndex, to); pressIndex = to; }
+            return;
+        }
+        if (m.Msg == WM_LBUTTONUP && pressIndex >= 0)
+        {
+            Capture = false;
+            if (moving && DragFinished != null) DragFinished();
+            pressIndex = -1;
+            moving = false;
+            return;
+        }
+        base.WndProc(ref m);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -559,7 +607,7 @@ public class MemoDesktop : Form
     ToolTip tip = new ToolTip();
     Timer saveTimer, poll;
     Note current;
-    bool loading;
+    bool loading, reordering;
 
     public static void Run(string dataPath)
     {
@@ -642,7 +690,18 @@ public class MemoDesktop : Form
             Bounds = new Rectangle(win.X + S(12), win.Y + S(56), sideW - S(24), win.Height - S(68))
         };
         list.DrawItem += DrawNoteItem;
-        list.SelectedIndexChanged += (s, e) => ShowNote();
+        list.SelectedIndexChanged += (s, e) => { if (!reordering) ShowNote(); };
+        list.DragThreshold = S(6);
+        list.ItemMoved += (from, to) =>
+        {
+            reordering = true;   // 같은 메모를 옮기는 것뿐이라 입력창을 다시 불러오지 않는다
+            var note = list.Items[from];
+            list.Items.RemoveAt(from);
+            list.Items.Insert(to, note);
+            list.SelectedIndex = to;
+            reordering = false;
+        };
+        list.DragFinished += ScheduleSave;
         list.MouseDown += (s, e) =>
         {
             int i = list.IndexFromPoint(e.Location);
@@ -923,6 +982,25 @@ public class MemoDesktop : Form
             IconSize = S(44), Pad = S(10), Radius = S(10), Ink = Ink, Muted = Gray, HoverBack = Hover
         };
         t.DoubleClick += (s, e) => Open(path);
+
+        // 끌어서 순서 바꾸기: 커서 밑에 다른 아이콘이 오면 그 자리로 바로 옮긴다
+        Point downAt = Point.Empty;
+        bool moving = false;
+        t.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { downAt = e.Location; moving = false; } };
+        t.MouseMove += (s, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (!moving && Math.Abs(e.X - downAt.X) + Math.Abs(e.Y - downAt.Y) < S(8)) return;
+            moving = true;
+            var target = icons.GetChildAtPoint(icons.PointToClient(t.PointToScreen(e.Location))) as Tile;
+            if (target == null || target == t) return;
+            int to = icons.Controls.GetChildIndex(target);
+            icons.Controls.SetChildIndex(t, to);
+            current.Items.Remove(path);
+            current.Items.Insert(to, path);
+        };
+        t.MouseUp += (s, e) => { if (moving) { moving = false; ScheduleSave(); } };
+
         var menu = new ContextMenuStrip();
         menu.Items.Add("열기", null, (s, e) => Open(path));
         menu.Items.Add("바로 가기 빼기", null, (s, e) =>
