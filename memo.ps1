@@ -49,8 +49,10 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -59,6 +61,359 @@ public class Note
     public string Text { get; set; }
     public List<string> Items { get; set; }   // 이 메모에 붙은 바로 가기 경로
     public Note() { Text = ""; Items = new List<string>(); }
+}
+
+// 기본 ListBox는 항목을 다시 그릴 때마다 지웠다 그려서 깜빡이므로, 화면 밖에서 다 그린 뒤 한 번에 내보낸다
+public class NoteList : ListBox
+{
+    public NoteList()
+    {
+        DrawMode = DrawMode.OwnerDrawFixed;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        using (var b = new SolidBrush(BackColor)) e.Graphics.FillRectangle(b, ClientRectangle);
+        for (int i = TopIndex; i < Items.Count; i++)
+        {
+            var r = GetItemRectangle(i);
+            if (r.Top > ClientSize.Height) break;
+            OnDrawItem(new DrawItemEventArgs(e.Graphics, Font, r, i, GetSelected(i) ? DrawItemState.Selected : DrawItemState.None));
+        }
+    }
+}
+
+// 마크다운 기호는 그대로 두고 흐리게 보이게, 내용은 제목·굵게·체크 등으로 바로 꾸며 주는 입력창 (저장은 평범한 마크다운 글)
+public class MarkdownBox : RichTextBox
+{
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, ref Point l);
+    [DllImport("user32.dll", EntryPoint = "SendMessage")]
+    static extern IntPtr SendMessageOle(IntPtr h, int msg, IntPtr w, [MarshalAs(UnmanagedType.IUnknown)] out object l);
+    [DllImport("imm32.dll")] static extern IntPtr ImmGetContext(IntPtr h);
+    [DllImport("imm32.dll")] static extern bool ImmReleaseContext(IntPtr h, IntPtr c);
+    [DllImport("imm32.dll", CharSet = CharSet.Unicode)] static extern int ImmGetCompositionString(IntPtr c, int index, IntPtr buf, int len);
+    const int WM_SETREDRAW = 0x0B, EM_GETSCROLLPOS = 0x4DD, EM_SETSCROLLPOS = 0x4DE, EM_GETOLEINTERFACE = 0x43C, GCS_COMPSTR = 0x8;
+    const int TomSuspend = -9999995, TomResume = -9999994;
+
+    public static readonly Regex Heading = new Regex(@"^(#{1,3})\s"),
+        Check = new Regex(@"^(\s*[-*+]\s\[([ xX])\])\s"),
+        Bullet = new Regex(@"^(\s*(?:[-*+]|\d+\.))\s"),
+        Quote = new Regex(@"^>\s?"),
+        Bold = new Regex(@"\*\*(.+?)\*\*"),
+        Strike = new Regex(@"~~(.+?)~~"),
+        Code = new Regex(@"`([^`]+)`");
+
+    public Color Ink, Muted, Accent, CodeBack;
+    public string FontName = "Segoe UI";
+    public float BaseSize = 13f;
+    public bool Styling { get; private set; }
+    Dictionary<string, Font> fonts = new Dictionary<string, Font>();
+    Timer timer;
+    bool needFull;
+
+    public MarkdownBox()
+    {
+        BorderStyle = BorderStyle.None;
+        DetectUrls = false;
+        AcceptsTab = true;
+        LanguageOption = (RichTextBoxLanguageOptions)0;   // 한글을 칠 때 글꼴을 멋대로 바꾸는 자동 글꼴 기능을 끈다
+        timer = new Timer { Interval = 300 };
+        timer.Tick += (s, e) =>
+        {
+            if (Composing()) return;   // 한글 조합 중에 꾸미면 조합이 끊긴다
+            timer.Stop();
+            Restyle(needFull);
+            needFull = false;
+        };
+    }
+
+    protected override void OnTextChanged(EventArgs e)
+    {
+        if (!Styling) { timer.Stop(); timer.Start(); }
+        base.OnTextChanged(e);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        // 웹 등에서 복사한 서식·그림이 섞이지 않게 글자만 붙여 넣는다
+        if ((e.Control && e.KeyCode == Keys.V) || (e.Shift && e.KeyCode == Keys.Insert))
+        {
+            e.SuppressKeyPress = true;
+            if (!ReadOnly && Clipboard.ContainsText())
+            {
+                needFull = true;
+                SelectedText = Clipboard.GetText().Replace("\r\n", "\n");
+            }
+            return;
+        }
+        base.OnKeyDown(e);
+    }
+
+    // 체크박스 "[ ]" 부분을 누르면 체크/해제
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button != MouseButtons.Left || SelectionLength > 0 || ReadOnly) return;
+        int idx = GetCharIndexFromPosition(e.Location);
+        string text = Text;
+        int start = idx > 0 ? text.LastIndexOf('\n', idx - 1) + 1 : 0;
+        int end = text.IndexOf('\n', start);
+        if (end < 0) end = text.Length;
+        var m = Check.Match(text.Substring(start, end - start));
+        if (!m.Success || idx > start + m.Groups[1].Length) return;
+        int box = text.IndexOf('[', start) + 1;
+        Select(box, 1);
+        SelectedText = m.Groups[2].Value == " " ? "x" : " ";
+        Select(start + m.Length, 0);
+    }
+
+    bool Composing()
+    {
+        IntPtr c = ImmGetContext(Handle);
+        if (c == IntPtr.Zero) return false;
+        try { return ImmGetCompositionString(c, GCS_COMPSTR, IntPtr.Zero, 0) > 0; }
+        finally { ImmReleaseContext(Handle, c); }
+    }
+
+    Font F(float size, FontStyle style, string name = null)
+    {
+        name = name ?? FontName;
+        string key = name + "|" + size + "|" + style;
+        Font f;
+        if (!fonts.TryGetValue(key, out f)) fonts[key] = f = new Font(name, size, style);
+        return f;
+    }
+
+    // 꾸미기도 되돌리기(Ctrl+Z) 기록에 쌓이면 Ctrl+Z가 글 대신 서식을 되돌리므로 그동안 기록을 멈춘다
+    void SetUndoRecording(bool on)
+    {
+        try
+        {
+            object doc;
+            SendMessageOle(Handle, EM_GETOLEINTERFACE, IntPtr.Zero, out doc);
+            doc.GetType().InvokeMember("Undo", BindingFlags.InvokeMethod, null, doc, new object[] { on ? TomResume : TomSuspend });
+            Marshal.ReleaseComObject(doc);
+        }
+        catch (Exception) { }   // 못 멈추면 서식 변경이 되돌리기 기록에 섞일 뿐
+    }
+
+    // all이 아니면 커서가 있는 줄과 바로 윗줄만 (Enter로 줄이 나뉘거나 합쳐질 때 두 줄이 바뀐다)
+    public void Restyle(bool all)
+    {
+        if (!IsHandleCreated) return;
+        string text = Text;
+        int caret = SelectionStart, selLen = SelectionLength;
+        int from = 0, to = text.Length;
+        if (!all)
+        {
+            int c = Math.Min(caret, text.Length);
+            int cur = c > 0 ? text.LastIndexOf('\n', c - 1) + 1 : 0;
+            from = cur >= 2 ? text.LastIndexOf('\n', cur - 2) + 1 : 0;
+            to = text.IndexOf('\n', c);
+            if (to < 0) to = text.Length;
+        }
+
+        var scroll = new Point();
+        SendMessage(Handle, EM_GETSCROLLPOS, IntPtr.Zero, ref scroll);
+        Styling = true;
+        SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+        SetUndoRecording(false);
+        try
+        {
+            int pos = from;
+            while (true)
+            {
+                int end = text.IndexOf('\n', pos);
+                if (end < 0) end = text.Length;
+                StyleLine(pos, text.Substring(pos, end - pos));
+                if (end >= to) break;
+                pos = end + 1;
+            }
+        }
+        finally
+        {
+            Select(caret, selLen);
+            SetUndoRecording(true);
+            SendMessage(Handle, EM_SETSCROLLPOS, IntPtr.Zero, ref scroll);
+            SendMessage(Handle, WM_SETREDRAW, new IntPtr(1), IntPtr.Zero);
+            Invalidate();
+            Styling = false;
+        }
+    }
+
+    void Style(int start, int length, Font font, Color color, Color back)
+    {
+        Select(start, length);
+        SelectionFont = font;
+        SelectionColor = color;
+        SelectionBackColor = back;
+    }
+
+    void StyleLine(int s, string line)
+    {
+        var body = F(BaseSize, FontStyle.Regular);
+        Style(s, line.Length, body, Ink, BackColor);
+        if (line.Length == 0) return;
+
+        var m = Heading.Match(line);
+        if (m.Success)
+        {
+            int level = m.Groups[1].Length;
+            var font = F(level == 1 ? BaseSize * 1.6f : level == 2 ? BaseSize * 1.3f : BaseSize * 1.1f, FontStyle.Bold);
+            Style(s, line.Length, font, Ink, BackColor);
+            Style(s, m.Length, font, Muted, BackColor);
+            return;
+        }
+        if ((m = Quote.Match(line)).Success)
+        {
+            Style(s, line.Length, F(BaseSize, FontStyle.Italic), Muted, BackColor);
+            return;
+        }
+        if ((m = Check.Match(line)).Success)
+        {
+            Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);
+            if (m.Groups[2].Value != " ")
+            {
+                Style(s + m.Length, line.Length - m.Length, F(BaseSize, FontStyle.Strikeout), Muted, BackColor);
+                return;
+            }
+        }
+        else if ((m = Bullet.Match(line)).Success)
+            Style(s, m.Groups[1].Length, F(BaseSize, FontStyle.Bold), Accent, BackColor);
+
+        foreach (Match b in Bold.Matches(line))
+        {
+            Style(s + b.Index, b.Length, F(BaseSize, FontStyle.Bold), Ink, BackColor);
+            Style(s + b.Index, 2, F(BaseSize, FontStyle.Bold), Muted, BackColor);
+            Style(s + b.Index + b.Length - 2, 2, F(BaseSize, FontStyle.Bold), Muted, BackColor);
+        }
+        foreach (Match x in Strike.Matches(line))
+            Style(s + x.Index, x.Length, F(BaseSize, FontStyle.Strikeout), Muted, BackColor);
+        foreach (Match c in Code.Matches(line))
+        {
+            var mono = F(BaseSize * 0.95f, FontStyle.Regular, "Consolas");
+            Style(s + c.Index, c.Length, mono, Ink, CodeBack);
+            Style(s + c.Index, 1, mono, Muted, CodeBack);
+            Style(s + c.Index + c.Length - 1, 1, mono, Muted, CodeBack);
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { timer.Dispose(); foreach (var f in fonts.Values) f.Dispose(); }
+        base.Dispose(disposing);
+    }
+}
+
+// 바로 가기를 담는 둥근 카드. 비어 있거나 파일을 끌고 오는 중이면 점선 테두리로 놓을 자리를 알려 준다
+public class ShortcutPanel : FlowLayoutPanel
+{
+    public Color Card, Border, DragCard, DragBorder, Muted;
+    public Font HintFont, HintSubFont;
+    public int Radius = 12;
+    public float Dpi = 1;
+    bool dragging;
+
+    public ShortcutPanel()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.ResizeRedraw, true);
+    }
+
+    public bool Dragging
+    {
+        get { return dragging; }
+        set { if (dragging != value) { dragging = value; Invalidate(true); } }
+    }
+
+    public Color Fill { get { return dragging ? DragCard : Card; } }
+
+    protected override void OnScroll(ScrollEventArgs se) { base.OnScroll(se); Invalidate(); }
+    protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Invalidate(); }
+    protected override void OnControlAdded(ControlEventArgs e) { base.OnControlAdded(e); Invalidate(); }
+    protected override void OnControlRemoved(ControlEventArgs e) { base.OnControlRemoved(e); Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(BackColor);
+        int inset = (int)Math.Ceiling(Dpi * 2);
+        var r = new Rectangle(inset, inset, Width - inset * 2 - 1, Height - inset * 2 - 1);
+        bool empty = Controls.Count == 0;
+        using (var path = MemoDesktop.RoundRect(r, Radius))
+        using (var b = new SolidBrush(Fill))
+        using (var pen = new Pen(dragging ? DragBorder : Border, Dpi * (dragging ? 2 : 1.2f)))
+        {
+            if (dragging || empty) pen.DashPattern = new[] { 4f, 3f };
+            g.FillPath(b, path);
+            g.DrawPath(pen, path);
+        }
+        if (!empty && !dragging) return;
+        string main = dragging ? "여기에 놓으면 이 메모의 바로 가기가 돼요" : "＋  파일 · 폴더 · 앱을 여기로 끌어다 놓으세요";
+        string sub = dragging ? "" : "이 메모를 열었을 때만 보이는 바로 가기가 돼요";
+        var flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
+        int mid = r.Y + r.Height / 2;
+        if (sub.Length == 0) TextRenderer.DrawText(g, main, HintFont, r, dragging ? DragBorder : Muted, flags);
+        else
+        {
+            int lh = HintFont.Height;
+            TextRenderer.DrawText(g, main, HintFont, new Rectangle(r.X, mid - lh, r.Width, lh), Muted, flags);
+            TextRenderer.DrawText(g, sub, HintSubFont, new Rectangle(r.X, mid + (int)(Dpi * 4), r.Width, HintSubFont.Height), Muted, flags);
+        }
+    }
+}
+
+// 바로 가기 아이콘 하나: 아이콘 + 두 줄까지 이름, 마우스를 올리면 둥근 배경
+public class Tile : Control
+{
+    public string Target;
+    public Image Icon;
+    public bool Missing;
+    public int IconSize = 44, Pad = 10, Radius = 10;
+    public Color Ink, Muted, HoverBack;
+    bool hover;
+
+    public Tile()
+    {
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var panel = Parent as ShortcutPanel;
+        g.Clear(panel != null ? panel.Fill : BackColor);
+        if (hover)
+            using (var b = new SolidBrush(HoverBack))
+            using (var path = MemoDesktop.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), Radius))
+                g.FillPath(b, path);
+        if (Icon != null)
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(Icon, (Width - IconSize) / 2, Pad, IconSize, IconSize);
+        }
+        int top = Pad + IconSize + Pad / 2;
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(Pad / 2, top, Width - Pad, Height - top - Pad / 2), Missing ? Muted : Ink,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            if (Icon != null) Icon.Dispose();
+            if (ContextMenuStrip != null) ContextMenuStrip.Dispose();   // 컨트롤을 지워도 메뉴는 따로 남는다
+        }
+        base.Dispose(disposing);
+    }
 }
 
 public class MemoDesktop : Form
@@ -96,7 +451,9 @@ public class MemoDesktop : Form
 
     static readonly Color Desk = Color.FromArgb(233, 231, 226), Paper = Color.White, Side = Color.FromArgb(246, 245, 242),
         Line = Color.FromArgb(226, 224, 219), Ink = Color.FromArgb(29, 29, 31), Gray = Color.FromArgb(138, 138, 142),
-        Pick = Color.FromArgb(250, 229, 150), Hover = Color.FromArgb(244, 243, 240);
+        Pick = Color.FromArgb(250, 229, 150), Hover = Color.FromArgb(240, 237, 229),
+        Gold = Color.FromArgb(201, 152, 30), Card = Color.FromArgb(251, 250, 246), DragCard = Color.FromArgb(255, 249, 226),
+        CodeBack = Color.FromArgb(243, 241, 236);
     const string FontName = "맑은 고딕";
 
     IntPtr parent;
@@ -106,9 +463,11 @@ public class MemoDesktop : Form
     int sideW, x0, w0, dividerY;
     string dataPath;
     System.Threading.EventWaitHandle stop;
-    ListBox list;
-    TextBox editor;
-    FlowLayoutPanel icons;
+    NoteList list;
+    MarkdownBox editor;
+    ShortcutPanel icons;
+    Label iconsTitle;
+    string shownPreview;     // 목록에 보이는 제목+미리보기 (바뀔 때만 목록을 다시 그린다)
     Font titleFont, subFont, tileFont;
     ToolTip tip = new ToolTip();
     Timer saveTimer, poll;
@@ -194,9 +553,9 @@ public class MemoDesktop : Form
         newBtn.Click += (s, e) => NewNote();
         tip.SetToolTip(newBtn, "새 메모");
 
-        list = new ListBox
+        list = new NoteList
         {
-            DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = Math.Min(255, S(68)), BorderStyle = BorderStyle.None,
+            ItemHeight = Math.Min(255, S(68)), BorderStyle = BorderStyle.None,
             BackColor = Side, IntegralHeight = false,
             Bounds = new Rectangle(win.X + S(12), win.Y + S(56), sideW - S(24), win.Height - S(68))
         };
@@ -213,39 +572,50 @@ public class MemoDesktop : Form
 
         x0 = win.X + sideW + S(56);
         w0 = win.Right - S(56) - x0;
-        int iconsH = S(150);
-        dividerY = win.Bottom - iconsH - S(56);
+        int iconsH = S(148);
+        dividerY = win.Bottom - iconsH - S(76);   // 바로 가기 영역의 위쪽 경계
 
-        editor = new TextBox
+        editor = new MarkdownBox
         {
-            Multiline = true, BorderStyle = BorderStyle.None, BackColor = Paper, ForeColor = Ink,
-            Font = new Font(FontName, 14f), AcceptsTab = true, MaxLength = 0,   // 기본값은 32767자 제한
-            Bounds = new Rectangle(x0, win.Y + S(48), w0, dividerY - S(16) - (win.Y + S(48)))
+            BackColor = Paper, ForeColor = Ink, Ink = Ink, Muted = Gray, Accent = Gold, CodeBack = CodeBack,
+            FontName = FontName, BaseSize = 13f, Font = new Font(FontName, 13f), MaxLength = int.MaxValue,
+            Bounds = new Rectangle(x0, win.Y + S(48), w0, dividerY - S(12) - (win.Y + S(48)))
         };
-        // 여러 줄 TextBox는 Ctrl+A를 기본으로 지원하지 않는다
-        editor.KeyDown += (s, e) => { if (e.Control && e.KeyCode == Keys.A) { editor.SelectAll(); e.SuppressKeyPress = true; } };
         editor.TextChanged += (s, e) =>
         {
-            if (loading || current == null) return;
+            if (loading || current == null || editor.Styling) return;
             current.Text = editor.Text;
-            if (list.SelectedIndex >= 0) list.Invalidate(list.GetItemRectangle(list.SelectedIndex));
+            string preview = string.Join("\n", Preview(current.Text));
+            if (preview != shownPreview && list.SelectedIndex >= 0)
+            {
+                shownPreview = preview;
+                list.Invalidate(list.GetItemRectangle(list.SelectedIndex));
+            }
             ScheduleSave();
         };
 
-        var header = new Label
+        iconsTitle = new Label
         {
-            Text = "바로 가기  ·  파일, 폴더, 프로그램을 여기로 끌어다 놓으세요", Font = subFont, ForeColor = Gray,
-            BackColor = Paper, AutoSize = false,
-            Bounds = new Rectangle(x0, dividerY + S(12), w0, S(28))
+            Font = new Font(FontName, 10f, FontStyle.Bold), ForeColor = Ink, BackColor = Paper, AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Bounds = new Rectangle(x0, dividerY + S(16), w0 / 2, S(30))
         };
-        icons = new FlowLayoutPanel
+        var iconsHint = new Label
         {
-            BackColor = Paper, AutoScroll = true,
-            Bounds = new Rectangle(x0 - S(4), win.Bottom - iconsH - S(12), w0 + S(8), iconsH)
+            Text = "더블클릭으로 열기 · 오른쪽 클릭으로 빼기", Font = new Font(FontName, 9f), ForeColor = Gray, BackColor = Paper,
+            AutoSize = false, TextAlign = ContentAlignment.MiddleRight,
+            Bounds = new Rectangle(x0 + w0 / 2, dividerY + S(16), w0 - w0 / 2, S(30))
         };
-        foreach (Control c in new Control[] { this, header, icons }) AcceptDrops(c);
+        icons = new ShortcutPanel
+        {
+            BackColor = Paper, AutoScroll = true, Card = Card, Border = Line, DragCard = DragCard, DragBorder = Gold, Muted = Gray,
+            HintFont = new Font(FontName, 10.5f), HintSubFont = new Font(FontName, 9f), Radius = S(12), Dpi = k,
+            Padding = new Padding(S(10)),
+            Bounds = new Rectangle(x0, win.Bottom - iconsH - S(24), w0, iconsH)
+        };
+        foreach (Control c in new Control[] { this, iconsTitle, iconsHint, icons }) AcceptDrops(c);
 
-        Controls.AddRange(new Control[] { newBtn, list, editor, header, icons });
+        Controls.AddRange(new Control[] { newBtn, list, editor, iconsTitle, iconsHint, icons });
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -267,7 +637,6 @@ public class MemoDesktop : Form
             g.FillRectangle(side, win.X, win.Y, sideW, win.Height);
             g.ResetClip();
             g.DrawLine(pen, win.X + sideW, win.Y, win.X + sideW, win.Bottom);
-            g.DrawLine(pen, x0, dividerY, x0 + w0, dividerY);
             g.DrawPath(pen, path);
         }
         // 맥 창 왼쪽 위의 빨강·노랑·초록 버튼 (장식)
@@ -277,7 +646,7 @@ public class MemoDesktop : Form
                 g.FillEllipse(b, win.X + S(20) + i * S(20), win.Y + S(20), S(12), S(12));
     }
 
-    static GraphicsPath RoundRect(Rectangle r, int radius)
+    public static GraphicsPath RoundRect(Rectangle r, int radius)
     {
         int d = radius * 2;
         var p = new GraphicsPath();
@@ -289,9 +658,22 @@ public class MemoDesktop : Form
         return p;
     }
 
-    static string[] Lines(string text)
+    static readonly Regex LineMarks = new Regex(@"^(#{1,6}\s+|\s*[-*+]\s\[[ xX]\]\s+|\s*(?:[-*+]|\d+\.)\s+|>\s?)");
+
+    // 목록에 보일 제목·미리보기: 앞의 빈 줄을 건너뛴 첫 두 줄을 마크다운 기호 없이 (글 전체를 나누지 않고 앞에서부터 찾는다)
+    static string[] Preview(string text)
     {
-        return text.Split('\n').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+        var lines = new List<string>();
+        int pos = 0;
+        while (lines.Count < 2 && pos <= text.Length)
+        {
+            int end = text.IndexOf('\n', pos);
+            if (end < 0) end = text.Length;
+            string line = LineMarks.Replace(text.Substring(pos, end - pos).Trim(), "").Replace("**", "").Replace("~~", "").Replace("`", "").Trim();
+            if (line.Length > 0) lines.Add(line);
+            pos = end + 1;
+        }
+        return lines.ToArray();
     }
 
     void DrawNoteItem(object sender, DrawItemEventArgs e)
@@ -307,7 +689,7 @@ public class MemoDesktop : Form
                 g.FillPath(b, path);
 
         // 맥 메모처럼 첫 줄이 제목, 둘째 줄이 미리보기
-        var lines = Lines(((Note)list.Items[e.Index]).Text);
+        var lines = Preview(((Note)list.Items[e.Index]).Text);
         string title = lines.Length > 0 ? lines[0] : "새로운 메모";
         string sub = lines.Length > 1 ? lines[1] : "추가 텍스트 없음";
         var flags = TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
@@ -321,8 +703,14 @@ public class MemoDesktop : Form
     {
         current = list.SelectedIndex >= 0 ? (Note)list.Items[list.SelectedIndex] : null;
         loading = true;
+        // 입력창은 줄바꿈을 \n 하나로 다루므로 맞춰 둔다 (예전 \r\n 메모도 그대로 열리게)
+        if (current != null) current.Text = current.Text.Replace("\r\n", "\n");
         editor.Text = current == null ? "" : current.Text;
-        editor.Enabled = current != null;
+        editor.ReadOnly = current == null;
+        // shortcut: 아주 긴 메모(20만 자 넘게)는 열 때 전체를 꾸미면 몇 초 멈춰서 커서 주변만 꾸민다, 자주 쓰이면 화면에 보이는 부분만 꾸미게 바꾸기
+        editor.Restyle(editor.TextLength <= 200000);
+        editor.ClearUndo();   // 다른 메모로 넘어온 뒤 Ctrl+Z로 이전 메모 내용이 돌아오지 않게
+        shownPreview = current == null ? null : string.Join("\n", Preview(current.Text));
         loading = false;
         RebuildIcons();
     }
@@ -339,7 +727,7 @@ public class MemoDesktop : Form
     {
         int i = list.SelectedIndex;
         if (i < 0) return;
-        var lines = Lines(((Note)list.Items[i]).Text);
+        var lines = Preview(((Note)list.Items[i]).Text);
         string title = lines.Length > 0 ? lines[0] : "새로운 메모";
         if (MessageBox.Show("'" + title + "' 메모를 지울까요?", "메모 삭제", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
         list.Items.RemoveAt(i);
@@ -372,10 +760,16 @@ public class MemoDesktop : Form
     }
 
     const string Welcome =
-        "메모 바탕화면\r\n" +
-        "왼쪽 위 + 로 새 메모를 만들어요. 첫 줄이 메모 제목이 돼요.\r\n\r\n" +
-        "아래 '바로 가기' 칸에 파일, 폴더, 프로그램을 끌어다 놓으면 이 메모 전용 아이콘이 생겨요.\r\n" +
-        "아이콘은 더블클릭하면 열리고, 오른쪽 클릭으로 뺄 수 있어요.\r\n\r\n" +
+        "# 메모 바탕화면\n" +
+        "왼쪽 위 **+** 로 새 메모를 만들어요. 첫 줄이 메모 제목이 돼요.\n\n" +
+        "## 마크다운\n" +
+        "- # 제목, ## 소제목, ### 작은 제목\n" +
+        "- **굵게**, ~~취소선~~, `코드`\n" +
+        "- [ ] 할 일은 - [ ] 로 쓰고, 네모를 누르면 체크돼요\n" +
+        "- [x] 끝난 일\n" +
+        "> 인용은 > 로 시작해요\n\n" +
+        "## 바로 가기\n" +
+        "아래 칸에 파일, 폴더, 프로그램을 끌어다 놓으면 이 메모 전용 아이콘이 생겨요.\n\n" +
         "메모는 쓰는 즉시 자동 저장돼요.";
 
     // 기본 한도(약 2MB)를 넘으면 저장이 실패하고, 읽을 때는 깨진 파일로 오해해서 치워 버린다
@@ -406,15 +800,19 @@ public class MemoDesktop : Form
         c.AllowDrop = true;
         c.DragEnter += OnDragEnter;
         c.DragDrop += OnDragDrop;
+        c.DragLeave += (s, e) => icons.Dragging = false;
     }
 
     void OnDragEnter(object sender, DragEventArgs e)
     {
-        e.Effect = current != null && e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        bool ok = current != null && e.Data.GetDataPresent(DataFormats.FileDrop);
+        e.Effect = ok ? DragDropEffects.Copy : DragDropEffects.None;
+        icons.Dragging = ok;
     }
 
     void OnDragDrop(object sender, DragEventArgs e)
     {
+        icons.Dragging = false;
         if (current == null) return;
         var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
         if (paths == null) return;
@@ -426,33 +824,28 @@ public class MemoDesktop : Form
 
     void RebuildIcons()
     {
-        var old = icons.Controls.Cast<Label>().ToList();
+        var old = icons.Controls.Cast<Tile>().ToList();
+        icons.SuspendLayout();
         icons.Controls.Clear();
-        foreach (var t in old)
-        {
-            if (t.Image != null) t.Image.Dispose();
-            if (t.ContextMenuStrip != null) t.ContextMenuStrip.Dispose();   // 라벨을 지워도 메뉴는 따로 남는다
-            tip.SetToolTip(t, null);
-            t.Dispose();
-        }
-        if (current == null) return;
-        foreach (var path in current.Items) icons.Controls.Add(MakeTile(path));
+        foreach (var t in old) { tip.SetToolTip(t, null); t.Dispose(); }
+        if (current != null)
+            foreach (var path in current.Items) icons.Controls.Add(MakeTile(path));
+        icons.ResumeLayout();
+        int n = current == null ? 0 : current.Items.Count;
+        iconsTitle.Text = n == 0 ? "바로 가기" : "바로 가기  " + n;
     }
 
-    Label MakeTile(string path)
+    Tile MakeTile(string path)
     {
         string name = Directory.Exists(path) ? Path.GetFileName(path.TrimEnd('\\')) : Path.GetFileNameWithoutExtension(path);
         if (string.IsNullOrEmpty(name)) name = path;   // 드라이브 루트(C:\ 등)
-        var t = new Label
+        var t = new Tile
         {
-            AutoSize = false, Size = new Size(S(96), S(112)), Text = name, Image = GetIcon(path, S(48)),
-            ImageAlign = ContentAlignment.TopCenter, TextAlign = ContentAlignment.BottomCenter, AutoEllipsis = true,
-            Font = tileFont, ForeColor = File.Exists(path) || Directory.Exists(path) ? Ink : Gray, BackColor = Paper,
-            Padding = new Padding(S(2), S(10), S(2), S(6)), Margin = new Padding(S(4)), Cursor = Cursors.Hand
+            Target = path, Text = name, Icon = GetIcon(path, S(44)), Missing = !File.Exists(path) && !Directory.Exists(path),
+            Size = new Size(S(92), S(106)), Margin = new Padding(S(2)), Font = tileFont,
+            IconSize = S(44), Pad = S(10), Radius = S(10), Ink = Ink, Muted = Gray, HoverBack = Hover
         };
         t.DoubleClick += (s, e) => Open(path);
-        t.MouseEnter += (s, e) => t.BackColor = Hover;
-        t.MouseLeave += (s, e) => t.BackColor = Paper;
         var menu = new ContextMenuStrip();
         menu.Items.Add("열기", null, (s, e) => Open(path));
         menu.Items.Add("바로 가기 빼기", null, (s, e) =>
@@ -537,6 +930,7 @@ public class MemoDesktop : Form
         base.OnShown(e);
         // WinForms가 창을 다 만든 뒤에 붙여야 한다 (더 일찍 붙이면 WinForms가 다시 떼어 숨겨버림)
         Attach();
+        ShowNote();   // 처음 불러올 때는 입력창이 아직 만들어지기 전이라 꾸미기를 못 했다
         poll = new Timer { Interval = 1000 };
         poll.Tick += (s, a) =>
         {
