@@ -1,0 +1,4 @@
+# 각자의 메모 내용과 실행 중 생기는 파일은 올리지 않음
+notes.json
+notes.json.*
+memo-error.log
